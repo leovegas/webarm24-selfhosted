@@ -1,0 +1,565 @@
+#!/usr/bin/env bash
+# webarmctl — operate a WebArm24 Self-hosted install (run from the bundle directory).
+#
+#   ./webarmctl preflight            check this server can run WebArm24
+#   ./webarmctl install              first install: .env + secrets, registry login, pull, start
+#   ./webarmctl status               containers, readiness, license, version
+#   ./webarmctl doctor               every health check, with the fix for each failure
+#   ./webarmctl license status       license state, seats, update window
+#   ./webarmctl license set <file>   install a license key file, reload
+#   ./webarmctl upgrade [tag]        backup → license check → drain → switch → verify → auto-rollback
+#   ./webarmctl rollback             back to the previous image tag
+#   ./webarmctl backup               database + stored files + .env + license → backups/*.tgz
+#   ./webarmctl restore <file>       restore a backup (asks for confirmation; --yes to skip)
+#   ./webarmctl smoke                end-to-end test (needs SMOKE_ADMIN_EMAIL / SMOKE_ADMIN_PASSWORD)
+#   ./webarmctl logs [svc] [-f]      container logs (app, db, caddy)
+#   ./webarmctl support-bundle       redacted diagnostics archive for vendor support
+#   ./webarmctl start|stop|restart   lifecycle
+#   ./webarmctl version              bundle + running image versions
+#   ./webarmctl uninstall [--purge]  remove containers (--purge also deletes ALL DATA volumes)
+#
+# Global flags: --json (one JSON object on stdout, for scripts and AI agents), --yes (no prompts).
+# Exit codes: 0 ok · 1 check failed · 2 usage error · 3 needs a human decision (prompt refused / --yes missing)
+#
+# Env knobs: WEBARM_REGISTRY_USER / WEBARM_REGISTRY_PASSWORD (non-interactive registry login),
+#            DRAIN_TIMEOUT (seconds, default 900), BACKUP_DIR (default ./backups), BACKUP_KEEP (default 14).
+set -euo pipefail
+
+VERSION_CTL="1.0.0"
+cd "$(dirname "$(readlink -f "$0")")"
+BUNDLE_DIR="$(pwd)"
+STATE_FILE="$BUNDLE_DIR/.webarm-state"
+BACKUP_DIR="${BACKUP_DIR:-$BUNDLE_DIR/backups}"
+BACKUP_KEEP="${BACKUP_KEEP:-14}"
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-900}"
+PROJECT="webarm"
+
+JSON=0; YES=0; ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --json) JSON=1 ;;
+    --yes|-y) YES=1 ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+CMD="${1:-help}"; shift || true
+
+# ── output helpers ─────────────────────────────────────────────────────────────────────────────
+CHECKS=()      # JSON fragments
+FAILED=0
+jesc() { local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; s="${s//$'\n'/\\n}"; s="${s//$'\t'/ }"; printf '%s' "$s"; }
+say()  { [ "$JSON" = 1 ] || printf '%s\n' "$*"; }
+info() { [ "$JSON" = 1 ] || printf '\033[36m•\033[0m %s\n' "$*"; }
+ok()   { CHECKS+=("{\"check\":\"$(jesc "$1")\",\"ok\":true,\"detail\":\"$(jesc "${2:-}")\"}");  [ "$JSON" = 1 ] || printf '  \033[32mOK\033[0m   %s%s\n' "$1" "${2:+ — $2}"; }
+bad()  { CHECKS+=("{\"check\":\"$(jesc "$1")\",\"ok\":false,\"detail\":\"$(jesc "${2:-}")\",\"fix\":\"$(jesc "${3:-}")\"}"); FAILED=1
+         [ "$JSON" = 1 ] || { printf '  \033[31mFAIL\033[0m %s%s\n' "$1" "${2:+ — $2}"; [ -n "${3:-}" ] && printf '       fix: %s\n' "$3"; }; }
+warn() { CHECKS+=("{\"check\":\"$(jesc "$1")\",\"ok\":true,\"warning\":true,\"detail\":\"$(jesc "${2:-}")\",\"fix\":\"$(jesc "${3:-}")\"}")
+         [ "$JSON" = 1 ] || { printf '  \033[33mWARN\033[0m %s%s\n' "$1" "${2:+ — $2}"; [ -n "${3:-}" ] && printf '       hint: %s\n' "$3"; }; }
+die()  { if [ "$JSON" = 1 ]; then printf '{"ok":false,"command":"%s","error":"%s"}\n' "$CMD" "$(jesc "$1")"; else printf '\033[31merror:\033[0m %s\n' "$1" >&2; fi; exit "${2:-1}"; }
+emit() { # emit <extra-json-fields-without-braces>
+  if [ "$JSON" = 1 ]; then
+    local list; list="$(IFS=,; echo "${CHECKS[*]-}")"
+    printf '{"ok":%s,"command":"%s","checks":[%s]%s}\n' "$([ $FAILED = 0 ] && echo true || echo false)" "$CMD" "$list" "${1:+,$1}"
+  fi
+}
+confirm() { # confirm "question"  → returns 0 if yes
+  [ "$YES" = 1 ] && return 0
+  [ "$JSON" = 1 ] && die "confirmation required: $1 (re-run with --yes)" 3
+  [ -t 0 ] || die "confirmation required: $1 (re-run with --yes)" 3
+  read -r -p "$1 [y/N] " r; [[ "$r" =~ ^[Yy] ]]
+}
+
+# ── environment helpers ────────────────────────────────────────────────────────────────────────
+dc() { # your own docker-compose.override.yml (git-ignored) is applied on top when present
+  local o=(); [ -f "$BUNDLE_DIR/docker-compose.override.yml" ] && o=(-f "$BUNDLE_DIR/docker-compose.override.yml")
+  docker compose -p "$PROJECT" --env-file "$BUNDLE_DIR/.env" -f "$BUNDLE_DIR/docker-compose.yml" ${o[@]+"${o[@]}"} "$@"
+}
+env_get() { [ -f .env ] || return 0; grep -E "^$1=" .env | tail -1 | cut -d= -f2- | sed -e 's/^"//' -e 's/"$//'; }
+env_set() { # env_set KEY VALUE (replace or append, keeps the rest of .env intact)
+  local k="$1" v="$2"
+  if grep -qE "^$k=" .env; then
+    local tmp; tmp="$(mktemp)"; awk -v k="$k" -v v="$v" 'BEGIN{FS=OFS="="} $1==k{print k"="v; next} {print}' .env > "$tmp" && cat "$tmp" > .env && rm -f "$tmp"
+  else
+    printf '%s=%s\n' "$k" "$v" >> .env
+  fi
+}
+state_get() { [ -f "$STATE_FILE" ] && grep -E "^$1=" "$STATE_FILE" | cut -d= -f2- || true; }
+state_set() { touch "$STATE_FILE"; if grep -qE "^$1=" "$STATE_FILE"; then sed -i "s|^$1=.*|$1=$2|" "$STATE_FILE"; else echo "$1=$2" >> "$STATE_FILE"; fi; }
+rand_alnum() { LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-40}"; }
+fernet_key() { head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '\n'; }
+image_ref() { echo "$(env_get WEBARM_IMAGE):$(env_get WEBARM_TAG)"; }
+app_running() { [ -n "$(dc ps -q app 2>/dev/null)" ] && [ "$(docker inspect -f '{{.State.Running}}' "$(dc ps -q app)" 2>/dev/null)" = "true" ]; }
+
+# GET a path on the app from inside its container (no DNS/TLS involved). Prints body; exit 0 even on HTTP errors.
+app_get() {
+  dc exec -T app python3 -c "
+import sys, urllib.request, urllib.error
+try:
+    print(urllib.request.urlopen('http://127.0.0.1:8000$1', timeout=10).read().decode())
+except urllib.error.HTTPError as e:
+    print(e.read().decode())
+except Exception as e:
+    print('{\"error\": \"%s\"}' % str(e).replace('\"', ''))
+" 2>/dev/null
+}
+jget() { # jget <json> <key>  — top-level value of a JSON object (host python3 if present, else a sed fallback)
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import json, sys
+try:
+    v = json.loads(sys.stdin.read()).get(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if isinstance(v, bool):
+    print("true" if v else "false")
+elif v is not None:
+    print(json.dumps(v) if isinstance(v, (dict, list)) else v)
+' "$2" <<<"$1"
+  else
+    sed -nE "s/.*\"$2\": ?\"?([^\",}]*)\"?.*/\1/p" <<<"$1" | head -1
+  fi
+}
+
+require_env() {
+  [ -f .env ] || die "no .env here — run ./webarmctl install first (from the bundle directory)" 2
+}
+
+# ── commands ───────────────────────────────────────────────────────────────────────────────────
+cmd_help() { sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//'; }
+
+cmd_preflight() {
+  say "Preflight checks"
+  if command -v docker >/dev/null 2>&1; then
+    local v; v="$(docker version -f '{{.Server.Version}}' 2>/dev/null || true)"
+    if [ -n "$v" ]; then ok "docker engine" "$v"; else bad "docker engine" "installed but not reachable" "start docker (systemctl start docker) and run as a user in the docker group or root"; fi
+  else
+    bad "docker engine" "not installed" "install Docker Engine 24+: https://docs.docker.com/engine/install/"
+  fi
+  if docker compose version >/dev/null 2>&1; then ok "docker compose" "$(docker compose version --short 2>/dev/null)"; else bad "docker compose v2" "missing" "install the docker-compose-plugin package"; fi
+  local arch; arch="$(uname -m)"
+  if [ "$arch" = "x86_64" ]; then ok "cpu architecture" "$arch"; else bad "cpu architecture" "$arch" "the image is built for x86_64 (amd64) only"; fi
+  local cpus mem_kb mem_gb
+  cpus="$(nproc 2>/dev/null || echo 1)"
+  mem_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"; mem_gb=$(( mem_kb / 1024 / 1024 ))
+  if [ "$cpus" -ge 2 ]; then ok "cpu cores" "$cpus"; else warn "cpu cores" "$cpus" "2+ cores recommended (4+ for parallel browser runs)"; fi
+  if [ "$mem_gb" -ge 4 ]; then ok "memory" "${mem_gb} GiB"; elif [ "$mem_gb" -ge 2 ]; then warn "memory" "${mem_gb} GiB" "4 GiB+ recommended; Chromium and Python steps are memory hungry"; else bad "memory" "${mem_gb} GiB" "at least 2 GiB (4 GiB recommended)"; fi
+  local free_gb; free_gb="$(df -Pk "$BUNDLE_DIR" | awk 'NR==2{print int($4/1024/1024)}')"
+  local droot; droot="$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)"
+  local dfree; dfree="$(df -Pk "$droot" 2>/dev/null | awk 'NR==2{print int($4/1024/1024)}' || echo "$free_gb")"
+  if [ "${dfree:-0}" -ge 20 ]; then ok "disk free (docker)" "${dfree} GiB"; else bad "disk free (docker)" "${dfree:-?} GiB at $droot" "20 GiB+ free needed (image ~6 GiB, plus data and backups)"; fi
+  local userns; userns="$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 1)"
+  local maxns; maxns="$(cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo 1)"
+  if [ "$userns" != "0" ] && [ "$maxns" != "0" ]; then ok "user namespaces (python sandbox)" "enabled"; else bad "user namespaces (python sandbox)" "disabled" "sysctl -w kernel.unprivileged_userns_clone=1 user.max_user_namespaces=15000 (persist in /etc/sysctl.d/)"; fi
+  if [ -r /sys/kernel/security/apparmor/profiles ] && grep -q "restrict_unprivileged_userns" /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null; then :; fi
+  if [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo 0)" = "1" ]; then
+    warn "apparmor userns restriction" "Ubuntu 24.04 restricts unprivileged user namespaces" "the compose file sets apparmor=unconfined for the app; if Python steps fail, see docs/12-troubleshooting.md#sandbox"
+  fi
+  for p in "${HTTP_PORT:-80}" "${HTTPS_PORT:-443}"; do
+    if (ss -ltnH 2>/dev/null || netstat -ltn 2>/dev/null) | awk '{print $4}' | grep -qE "[:.]$p$"; then
+      if docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -q "webarm-caddy.*:$p->"; then ok "port $p" "used by this install"; else bad "port $p" "already in use" "free the port or set HTTP_PORT/HTTPS_PORT in .env and put your own proxy in front (docs/05-domain-tls.md)"; fi
+    else ok "port $p" "free"; fi
+  done
+  local host; host="$(env_get PUBLIC_HOST)"
+  if [ -n "$host" ] && [ "$host" != "automation.example.com" ]; then
+    local ip; ip="$(getent ahosts "$host" 2>/dev/null | awk 'NR==1{print $1}')"
+    if [ -n "$ip" ]; then
+      local mine; mine="$(hostname -I 2>/dev/null || true) $(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+      if grep -qw "$ip" <<<"$mine"; then ok "dns $host" "→ $ip (this server)"; else warn "dns $host" "→ $ip, which is not an address of this server" "point the A/AAAA record here, or use TLS_MODE=internal / your own proxy"; fi
+    else
+      bad "dns $host" "does not resolve" "create an A/AAAA record for $host → this server's public IP (needed for automatic HTTPS)"
+    fi
+  else
+    warn "PUBLIC_HOST" "not configured yet" "install will ask for it"
+  fi
+  if curl -fsS --max-time 8 -o /dev/null "https://registry.webarm24.online/v2/" 2>/dev/null || [ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 https://registry.webarm24.online/v2/ 2>/dev/null)" = "401" ]; then
+    ok "registry reachable" "registry.webarm24.online"
+  else
+    warn "registry reachable" "registry.webarm24.online did not answer" "air-gapped? load the image from a tarball (docs/13-air-gapped.md)"
+  fi
+  emit
+  return $FAILED
+}
+
+registry_login() {
+  local img reg; img="$(env_get WEBARM_IMAGE)"; reg="${img%%/*}"
+  if docker image inspect "$(image_ref)" >/dev/null 2>&1; then return 0; fi
+  if [ -n "${WEBARM_REGISTRY_USER:-}" ] && [ -n "${WEBARM_REGISTRY_PASSWORD:-}" ]; then
+    printf '%s' "$WEBARM_REGISTRY_PASSWORD" | docker login "$reg" -u "$WEBARM_REGISTRY_USER" --password-stdin >/dev/null || die "registry login failed for $WEBARM_REGISTRY_USER@$reg"
+    return 0
+  fi
+  if grep -q "\"$reg\"" "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null; then return 0; fi
+  [ -t 0 ] && [ "$JSON" = 0 ] || die "not logged in to $reg: set WEBARM_REGISTRY_USER (license id) and WEBARM_REGISTRY_PASSWORD (from your purchase e-mail)" 3
+  say "Registry login for $reg — username is your license id (lic_…), password is in your purchase e-mail."
+  docker login "$reg"
+}
+
+wait_healthy() { # wait_healthy <seconds>
+  local t="${1:-180}" i=0
+  while [ $i -lt "$t" ]; do
+    local st; st="$(docker inspect -f '{{.State.Health.Status}}' "$(dc ps -q app 2>/dev/null)" 2>/dev/null || echo starting)"
+    [ "$st" = "healthy" ] && return 0
+    sleep 2; i=$((i + 2))
+  done
+  return 1
+}
+
+render_caddyfile() {
+  local mode; mode="$(env_get TLS_MODE)"
+  local line=""; [ "$mode" = "internal" ] && line="tls internal"
+  sed "s|@@TLS@@|$line|" Caddyfile.template > Caddyfile
+}
+
+cmd_install() {
+  say "WebArm24 Self-hosted — install (bundle $(cat VERSION 2>/dev/null || echo dev))"
+  cmd_preflight || { [ "$JSON" = 1 ] && exit 1; confirm "Preflight reported failures. Continue anyway?" || exit 1; }
+  CHECKS=(); FAILED=0
+  if [ ! -f .env ]; then
+    cp .env.example .env; chmod 600 .env
+    info "created .env from .env.example"
+  fi
+  [ -z "$(env_get POSTGRES_PASSWORD)" ] && env_set POSTGRES_PASSWORD "$(rand_alnum 32)" && info "generated POSTGRES_PASSWORD"
+  [ -z "$(env_get JWT_SECRET)" ] && env_set JWT_SECRET "$(rand_alnum 64)" && info "generated JWT_SECRET"
+  [ -z "$(env_get PIPELINE_FIELD_ENCRYPTION_KEY)" ] && env_set PIPELINE_FIELD_ENCRYPTION_KEY "$(fernet_key)" && info "generated PIPELINE_FIELD_ENCRYPTION_KEY (back up .env!)"
+  if [ "$(env_get PUBLIC_HOST)" = "automation.example.com" ] || [ -z "$(env_get PUBLIC_HOST)" ]; then
+    [ -n "${PUBLIC_HOST:-}" ] || { [ -t 0 ] && [ "$JSON" = 0 ] && read -r -p "Public host name (e.g. automation.acme.com): " PUBLIC_HOST; }
+    [ -n "${PUBLIC_HOST:-}" ] || die "PUBLIC_HOST is not set: edit .env or export PUBLIC_HOST=… and re-run" 3
+    env_set PUBLIC_HOST "$PUBLIC_HOST"
+  fi
+  if [ "$(env_get ADMIN_EMAILS)" = "admin@example.com" ] || [ -z "$(env_get ADMIN_EMAILS)" ]; then
+    [ -n "${ADMIN_EMAILS:-}" ] || { [ -t 0 ] && [ "$JSON" = 0 ] && read -r -p "Administrator e-mail(s), comma separated: " ADMIN_EMAILS; }
+    [ -n "${ADMIN_EMAILS:-}" ] || die "ADMIN_EMAILS is not set: edit .env or export ADMIN_EMAILS=… and re-run" 3
+    env_set ADMIN_EMAILS "$ADMIN_EMAILS"
+  fi
+  mkdir -p license custom "$BACKUP_DIR"; chmod 700 license "$BACKUP_DIR"
+  if [ -n "${LICENSE_FILE:-}" ]; then install_key_file "$LICENSE_FILE"; fi
+  render_caddyfile
+  if docker image inspect "$(image_ref)" >/dev/null 2>&1; then
+    info "using local image $(image_ref) (loaded or pulled earlier)"
+  else
+    registry_login
+    info "pulling $(image_ref) (first pull is ~6 GiB)…"
+    docker pull -q "$(image_ref)" >/dev/null || die "cannot pull $(image_ref): registry login? (docs/02-install.md) — offline: docker load the image tarball (docs/13-air-gapped.md)"
+  fi
+  dc pull --quiet --ignore-pull-failures db caddy 2>/dev/null || true
+  dc up -d
+  info "waiting for the app to become healthy…"
+  if wait_healthy 300; then ok "app healthy"; else bad "app healthy" "not healthy after 5 minutes" "./webarmctl logs app"; fi
+  state_set CURRENT_TAG "$(env_get WEBARM_TAG)"
+  local r; r="$(app_get /ready)"
+  local lst; lst="$(jget "$r" license)"
+  if [ "$lst" = "valid" ]; then ok "license" "valid"; else warn "license" "${lst:-unknown} ($(jget "$r" license_code))" "open https://$(env_get PUBLIC_HOST)/setup, create the admin account and paste the key — or ./webarmctl license set license.key"; fi
+  say ""
+  say "Next: open https://$(env_get PUBLIC_HOST)/setup — sign up with $(env_get ADMIN_EMAILS | cut -d, -f1), activate the license."
+  say "Then: ./webarmctl backup   (and schedule it: see docs/09-backup-restore.md)"
+  emit "\"url\":\"https://$(jesc "$(env_get PUBLIC_HOST)")/setup\",\"license\":\"$(jesc "$lst")\""
+  return $FAILED
+}
+
+install_key_file() {
+  local f="$1"
+  [ -f "$f" ] || die "license file not found: $f" 2
+  local key; key="$(tr -d '[:space:]' < "$f")"
+  [[ "$key" == WA1.* ]] || die "$f does not contain a WebArm license key (WA1.…)" 2
+  mkdir -p license; chmod 700 license
+  printf '%s\n' "$key" > license/webarm_license; chmod 644 license/webarm_license
+  info "license key installed at license/webarm_license"
+}
+
+cmd_license() {
+  require_env
+  local sub="${1:-status}"
+  case "$sub" in
+    status)
+      app_running || die "the app is not running (./webarmctl start)"
+      local r; r="$(app_get /ready)"
+      local st code; st="$(jget "$r" license)"; code="$(jget "$r" license_code)"
+      if [ "$st" = "valid" ]; then ok "license" "valid"; else bad "license" "$st $code" "see docs/04-license.md#$code"; fi
+      if [ -f license/webarm_license ]; then
+        # decode the (unsigned-checked) payload locally for display — the app verifies the signature
+        local payload; payload="$(cut -d. -f2 < license/webarm_license | tr '_-' '/+' | base64 -d 2>/dev/null || true)"
+        [ -n "$payload" ] && say "  key file: $payload"
+      fi
+      emit "\"license\":\"$(jesc "$st")\",\"code\":\"$(jesc "$code")\",\"ready\":$( [ -n "$r" ] && echo "$r" || echo null)"
+      return $FAILED ;;
+    set)
+      local f="${2:-}"; [ -n "$f" ] || die "usage: webarmctl license set <license.key>" 2
+      install_key_file "$f"
+      if app_running; then
+        info "restarting the app to load the key…"; dc restart app >/dev/null; wait_healthy 180 || true
+        local r; r="$(app_get /ready)"; local st; st="$(jget "$r" license)"
+        if [ "$st" = "valid" ]; then ok "license" "valid"; else bad "license" "$st $(jget "$r" license_code)" "check the key file; ./webarmctl logs app | grep License"; fi
+      fi
+      emit; return $FAILED ;;
+    *) die "usage: webarmctl license status|set <file>" 2 ;;
+  esac
+}
+
+cmd_status() {
+  require_env
+  local img; img="$(image_ref)"
+  say "Install: $BUNDLE_DIR   image: $img"
+  for s in app db caddy; do
+    local id st; id="$(dc ps -q "$s" 2>/dev/null)"
+    if [ -n "$id" ]; then
+      st="$(docker inspect -f '{{.State.Status}}{{if .State.Health}} ({{.State.Health.Status}}){{end}}' "$id")"
+      [[ "$st" == running* ]] && [[ "$st" != *unhealthy* ]] && ok "$s" "$st" || bad "$s" "$st" "./webarmctl logs $s"
+    else
+      bad "$s" "not created" "./webarmctl start"
+    fi
+  done
+  local r=""; if app_running; then r="$(app_get /ready)"; fi
+  if [ -n "$r" ]; then
+    [ "$(jget "$r" ready)" = "true" ] && ok "ready" "version $(jget "$r" version)" || bad "ready" "$r" "./webarmctl logs app"
+    local lst; lst="$(jget "$r" license)"
+    [ "$lst" = "valid" ] && ok "license" "valid" || bad "license" "$lst $(jget "$r" license_code)" "docs/04-license.md"
+    say "  in-flight work: $(jget "$r" busy_total)"
+  fi
+  emit "\"image\":\"$(jesc "$img")\",\"ready\":$( [ -n "$r" ] && echo "$r" || echo null)"
+  return $FAILED
+}
+
+cmd_doctor() {
+  require_env
+  say "Doctor"
+  cmd_status >/dev/null 2>&1 || true
+  local saved_json=$JSON
+  CHECKS=(); FAILED=0
+  for s in app db caddy; do
+    local id; id="$(dc ps -q "$s" 2>/dev/null)"
+    if [ -z "$id" ]; then bad "container $s" "not running" "./webarmctl start"; continue; fi
+    local st; st="$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} restarts={{.RestartCount}}' "$id")"
+    if [[ "$st" == running* ]] && [[ "$st" != *unhealthy* ]]; then ok "container $s" "$st"; else bad "container $s" "$st" "./webarmctl logs $s"; fi
+  done
+  if app_running; then
+    local r; r="$(app_get /ready)"
+    local lst; lst="$(jget "$r" license)"
+    case "$lst" in
+      valid) ok "license" "valid" ;;
+      missing) bad "license" "no key (WA-LIC-001)" "./webarmctl license set license.key, or paste it at https://$(env_get PUBLIC_HOST)/setup" ;;
+      outdated) bad "license" "image newer than your update window (WA-LIC-002)" "renew Updates and refresh the key, or ./webarmctl rollback / upgrade <older tag>" ;;
+      invalid) bad "license" "key does not verify (WA-LIC-003)" "download the key again from https://webarm24.online/self-hosted" ;;
+      revoked) bad "license" "revoked for this version (WA-LIC-004)" "contact the vendor" ;;
+      *) bad "license" "unknown: $r" "./webarmctl logs app" ;;
+    esac
+    if dc exec -T app sh -c 'bwrap --ro-bind / / --unshare-all --die-with-parent true' >/dev/null 2>&1; then ok "python sandbox (bubblewrap)"; else bad "python sandbox (bubblewrap)" "cannot create namespaces" "see docs/12-troubleshooting.md#sandbox (cap_add/security_opt, kernel user namespaces)"; fi
+    if dc exec -T db pg_isready -U webarm -d webarm >/dev/null 2>&1; then ok "database"; else bad "database" "not accepting connections" "./webarmctl logs db"; fi
+    local ai; ai="$(dc exec -T app sh -c 'test -n "$ANTHROPIC_API_KEY$OPENAI_API_KEY$OPENROUTER_API_KEY" && echo yes || echo no' 2>/dev/null)"
+    [ "$ai" = "yes" ] && ok "AI provider key" || warn "AI provider key" "none set" "set ANTHROPIC_API_KEY or OPENAI_API_KEY in .env (docs/06-ai-providers.md)"
+    local smtp; smtp="$(env_get SMTP_HOST)"
+    [ -n "$smtp" ] && ok "SMTP" "$smtp" || warn "SMTP" "not configured" "password resets and approval e-mails need SMTP (docs/07-email.md)"
+  fi
+  local host; host="$(env_get PUBLIC_HOST)"
+  local code; code="$(curl -sk -o /dev/null -w '%{http_code}' --max-time 10 "https://$host/health" 2>/dev/null || echo 000)"
+  if [ "$code" = "200" ]; then
+    ok "https://$host" "reachable"
+    if [ "$(env_get TLS_MODE)" != "internal" ]; then
+      local days; days="$(echo | openssl s_client -servername "$host" -connect "$host:443" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)"
+      [ -n "$days" ] && ok "tls certificate" "expires $days" || warn "tls certificate" "could not read" "./webarmctl logs caddy"
+    fi
+  else
+    bad "https://$host" "HTTP $code" "DNS for $host must point here and ports 80/443 must be open; ./webarmctl logs caddy"
+  fi
+  local dfree; dfree="$(df -Pk "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /)" | awk 'NR==2{print int($4/1024/1024)}')"
+  [ "${dfree:-0}" -ge 5 ] && ok "disk free" "${dfree} GiB" || bad "disk free" "${dfree} GiB" "free space: docker image prune, old backups in $BACKUP_DIR"
+  local last; last="$(ls -1t "$BACKUP_DIR"/webarm-*.tgz 2>/dev/null | head -1 || true)"
+  if [ -n "$last" ]; then
+    local age=$(( ( $(date +%s) - $(stat -c %Y "$last") ) / 3600 ))
+    [ $age -le 48 ] && ok "last backup" "$(basename "$last") (${age}h ago)" || warn "last backup" "${age}h ago" "schedule ./webarmctl backup daily (docs/09-backup-restore.md)"
+  else
+    warn "last backup" "none" "./webarmctl backup — and schedule it"
+  fi
+  JSON=$saved_json
+  emit "\"image\":\"$(jesc "$(image_ref)")\""
+  return $FAILED
+}
+
+cmd_backup() {
+  require_env
+  mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+  local ts; ts="$(date -u +%Y%m%d-%H%M%S)"
+  local work; work="$(mktemp -d)"
+  trap 'rm -rf "$work"' RETURN
+  info "dumping the database…"
+  dc exec -T db pg_dump -U webarm -d webarm -Fc > "$work/db.dump" || die "pg_dump failed (is the db container running?)"
+  info "archiving stored files (appdata volume)…"
+  docker run --rm -v "${PROJECT}_appdata:/data:ro" -v "$work:/out" alpine:3.20 \
+    sh -c 'cd /data && tar --exclude=./python_envs --exclude=./python_steps -czf /out/appdata.tgz .' || die "appdata archive failed"
+  cp .env "$work/env"; [ -f license/webarm_license ] && cp license/webarm_license "$work/license.key"
+  [ -d custom ] && tar -C . -czf "$work/custom.tgz" custom
+  printf '{"created":"%s","image":"%s","bundle":"%s"}\n' "$ts" "$(image_ref)" "$(cat VERSION 2>/dev/null || echo dev)" > "$work/manifest.json"
+  local out="$BACKUP_DIR/webarm-$ts.tgz"
+  tar -C "$work" -czf "$out" . && chmod 600 "$out"
+  ls -1t "$BACKUP_DIR"/webarm-*.tgz 2>/dev/null | tail -n +"$((BACKUP_KEEP + 1))" | xargs -r rm -f
+  ok "backup" "$out ($(du -h "$out" | cut -f1))"
+  say "  contains secrets (.env): copy it off this server, encrypted (docs/09-backup-restore.md)."
+  emit "\"file\":\"$(jesc "$out")\""
+}
+
+cmd_restore() {
+  require_env
+  local f="${1:-}"; [ -f "$f" ] || die "usage: webarmctl restore <backups/webarm-….tgz>" 2
+  confirm "Restore $f? This REPLACES the current database and stored files." || die "restore cancelled" 3
+  local work; work="$(mktemp -d)"; trap 'rm -rf "$work"' RETURN
+  tar -C "$work" -xzf "$f"
+  [ -f "$work/db.dump" ] || die "$f is not a webarmctl backup (no db.dump)"
+  if [ -f "$work/env" ] && ! diff -q <(grep -E '^PIPELINE_FIELD_ENCRYPTION_KEY=' "$work/env") <(grep -E '^PIPELINE_FIELD_ENCRYPTION_KEY=' .env) >/dev/null; then
+    warn "encryption key" "backup was made with a different PIPELINE_FIELD_ENCRYPTION_KEY" "restoring the backup's .env too (current one saved as .env.before-restore)"
+    cp .env .env.before-restore; cp "$work/env" .env; chmod 600 .env
+  fi
+  info "stopping the app…"; dc stop app >/dev/null
+  info "restoring the database…"
+  dc exec -T db sh -c 'dropdb -U webarm --if-exists webarm_restore_tmp; createdb -U webarm webarm_restore_tmp' >/dev/null
+  dc exec -T db pg_restore -U webarm -d webarm_restore_tmp --no-owner < "$work/db.dump" || die "pg_restore failed; current database untouched"
+  dc exec -T db sh -c 'psql -U webarm -d postgres -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='"'"'webarm'"'"' AND pid <> pg_backend_pid();" >/dev/null; dropdb -U webarm webarm && psql -U webarm -d postgres -c "ALTER DATABASE webarm_restore_tmp RENAME TO webarm;" >/dev/null' || die "database swap failed"
+  info "restoring stored files…"
+  docker run --rm -v "${PROJECT}_appdata:/data" -v "$work:/in:ro" alpine:3.20 sh -c 'find /data -mindepth 1 -maxdepth 1 ! -name python_envs -exec rm -rf {} + && tar -C /data -xzf /in/appdata.tgz'
+  [ -f "$work/license.key" ] && { mkdir -p license; cp "$work/license.key" license/webarm_license; }
+  [ -f "$work/custom.tgz" ] && tar -C . -xzf "$work/custom.tgz"
+  dc up -d app >/dev/null
+  wait_healthy 240 && ok "restore" "app healthy" || bad "restore" "app not healthy after restore" "./webarmctl logs app"
+  emit; return $FAILED
+}
+
+image_build_date() { docker image inspect -f '{{ index .Config.Labels "webarm.build_date" }}' "$1" 2>/dev/null || true; }
+
+drain_and_wait() {
+  info "draining: new runs go nowhere, in-flight pipelines/workflows finish (timeout ${DRAIN_TIMEOUT}s)…"
+  dc exec -T app sh -c 'touch "${INSTANCE_DRAIN_FILE:-/tmp/webarm-drain}"' >/dev/null 2>&1 || true
+  local i=0
+  while [ $i -lt "$DRAIN_TIMEOUT" ]; do
+    local r busy; r="$(app_get /ready)"; busy="$(jget "$r" busy_total)"
+    [ "${busy:-0}" = "0" ] && return 0
+    [ $((i % 30)) = 0 ] && info "  still running: $busy"
+    sleep 5; i=$((i + 5))
+  done
+  warn "drain" "timed out with work still running" "it will be failed and can be re-run"
+}
+
+switch_to() { # switch_to <tag>
+  env_set WEBARM_TAG "$1"
+  dc up -d --force-recreate app >/dev/null
+  wait_healthy 300
+}
+
+cmd_upgrade() {
+  require_env
+  local target="${1:-stable}" cur; cur="$(env_get WEBARM_TAG)"
+  local img; img="$(env_get WEBARM_IMAGE)"
+  if [[ "$target" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && docker image inspect "$img:$target" >/dev/null 2>&1; then
+    info "using local image $img:$target"
+  else
+    registry_login
+    info "pulling $img:$target…"
+    if ! docker pull -q "$img:$target" >/dev/null; then
+      docker image inspect "$img:$target" >/dev/null 2>&1 || die "cannot pull $img:$target (tag exists? registry login? offline: docker load it first)"
+      warn "pull" "registry unreachable; using the local $img:$target" ""
+    fi
+  fi
+  local bd; bd="$(image_build_date "$img:$target")"
+  local until=""
+  if app_running; then
+    until="$(dc exec -T app python3 -c "import pathlib,json,base64; k=pathlib.Path('/run/secrets/webarm_license').read_text().strip() if pathlib.Path('/run/secrets/webarm_license').exists() else ''; p=k.split('.')[1] if k else ''; print(json.loads(base64.urlsafe_b64decode(p+'='*(-len(p)%4))).get('updates_until','') if p else '')" 2>/dev/null || true)"
+  fi
+  if [ -n "$bd" ] && [ -n "$until" ] && [[ "$bd" > "$until" ]]; then
+    bad "license covers $target" "image built $bd, your updates end $until (WA-LIC-002)" "renew the Updates subscription and refresh the key first, or pick an older tag"
+    emit; return 1
+  fi
+  [ -n "$until" ] && ok "license covers $target" "built ${bd:-?}, updates until $until"
+  info "backup before upgrade…"; cmd_backup >/dev/null
+  state_set PREVIOUS_TAG "$cur"
+  if app_running; then drain_and_wait; fi
+  info "switching $cur → $target…"
+  if switch_to "$target"; then
+    local r; r="$(app_get /ready)"
+    if [ "$(jget "$r" license)" = "valid" ]; then
+      state_set CURRENT_TAG "$target"
+      ok "upgrade" "now on $target ($(jget "$r" version))"
+      emit "\"from\":\"$(jesc "$cur")\",\"to\":\"$(jesc "$target")\""; return 0
+    fi
+    bad "upgrade" "license not valid on $target: $(jget "$r" license_code)" "rolled back"
+  else
+    bad "upgrade" "$target did not become healthy" "rolled back; ./webarmctl logs app"
+  fi
+  info "rolling back to $cur…"; switch_to "$cur" || true
+  emit "\"rolled_back_to\":\"$(jesc "$cur")\""; return 1
+}
+
+cmd_rollback() {
+  require_env
+  local prev; prev="$(state_get PREVIOUS_TAG)"
+  [ -n "$prev" ] || die "no previous tag recorded (.webarm-state)"
+  confirm "Roll back from $(env_get WEBARM_TAG) to $prev? (the database is not rolled back; use restore for that)" || die "cancelled" 3
+  state_set PREVIOUS_TAG "$(env_get WEBARM_TAG)"
+  if switch_to "$prev"; then state_set CURRENT_TAG "$prev"; ok "rollback" "now on $prev"; else bad "rollback" "$prev not healthy" "./webarmctl logs app"; fi
+  emit; return $FAILED
+}
+
+cmd_smoke() {
+  require_env
+  app_running || die "the app is not running"
+  local email="${SMOKE_ADMIN_EMAIL:-}" pw="${SMOKE_ADMIN_PASSWORD:-}"
+  [ -n "$email" ] && [ -n "$pw" ] || die "set SMOKE_ADMIN_EMAIL and SMOKE_ADMIN_PASSWORD (an admin account of this install)" 2
+  local extra=(); [ "$JSON" = 1 ] && extra+=(--json)
+  dc exec -T app python3 /opt/webarm/smoke_test.py --base http://127.0.0.1:8000 \
+    --admin-email "$email" --admin-password "$pw" --python "${extra[@]+"${extra[@]}"}"
+}
+
+cmd_support_bundle() {
+  require_env
+  local ts out work; ts="$(date -u +%Y%m%d-%H%M%S)"; work="$(mktemp -d)"; out="$BUNDLE_DIR/webarm-support-$ts.tgz"
+  JSON=1 cmd_doctor > "$work/doctor.json" 2>/dev/null || true
+  dc ps > "$work/ps.txt" 2>&1 || true
+  for s in app db caddy; do dc logs --no-color --tail 800 "$s" 2>&1 | sed -E 's/(Bearer |token=|password=|key=)[^ &"]+/\1<redacted>/gI' > "$work/logs-$s.txt" || true; done
+  sed -E 's/^([A-Z0-9_]*(KEY|SECRET|PASSWORD|TOKEN|PASS)[A-Z0-9_]*)=.+/\1=<redacted>/' .env > "$work/env.redacted"
+  { uname -a; docker version 2>&1; docker info 2>&1 | head -40; free -m; df -h; } > "$work/host.txt" 2>&1
+  app_running && app_get /ready > "$work/ready.json"
+  cat VERSION > "$work/bundle-version" 2>/dev/null || true
+  tar -C "$work" -czf "$out" . && rm -rf "$work"
+  ok "support bundle" "$out"
+  say "  secrets are redacted; review it, then send it to support with a description of the problem."
+  emit "\"file\":\"$(jesc "$out")\""
+}
+
+cmd_logs() { require_env; dc logs --tail 200 "$@"; }
+cmd_start() { require_env; render_caddyfile; dc up -d; wait_healthy 240 && ok "start" || bad "start" "app not healthy" "./webarmctl logs app"; emit; return $FAILED; }
+cmd_stop() { require_env; dc stop; ok "stop"; emit; }
+cmd_restart() { require_env; render_caddyfile; dc up -d >/dev/null; dc restart app caddy >/dev/null; wait_healthy 240 && ok "restart" || bad "restart" "app not healthy" "./webarmctl logs app"; emit; return $FAILED; }
+cmd_version() {
+  local bundle; bundle="$(cat VERSION 2>/dev/null || echo dev)"
+  local run=""; [ -f .env ] && app_running && run="$(jget "$(app_get /ready)" version)"
+  say "webarmctl $VERSION_CTL · bundle $bundle · image $( [ -f .env ] && image_ref || echo '-') · running ${run:-not running}"
+  emit "\"webarmctl\":\"$VERSION_CTL\",\"bundle\":\"$(jesc "$bundle")\",\"running\":\"$(jesc "$run")\""
+}
+cmd_uninstall() {
+  require_env
+  if [ "${1:-}" = "--purge" ]; then
+    confirm "DELETE ALL DATA (database, stored files, certificates)? Make a backup first. This cannot be undone." || die "cancelled" 3
+    dc down -v; ok "uninstall" "containers and volumes removed"
+  else
+    dc down; ok "uninstall" "containers removed; data volumes kept (use --purge to delete them)"
+  fi
+  emit
+}
+
+case "$CMD" in
+  help|-h|--help) cmd_help ;;
+  preflight) cmd_preflight ;;
+  install) cmd_install ;;
+  status) cmd_status ;;
+  doctor) cmd_doctor ;;
+  license) cmd_license "$@" ;;
+  upgrade) cmd_upgrade "$@" ;;
+  rollback) cmd_rollback ;;
+  backup) cmd_backup ;;
+  restore) cmd_restore "$@" ;;
+  smoke) cmd_smoke ;;
+  logs) cmd_logs "$@" ;;
+  support-bundle) cmd_support_bundle ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  version) cmd_version ;;
+  uninstall) cmd_uninstall "$@" ;;
+  *) die "unknown command '$CMD' (./webarmctl help)" 2 ;;
+esac

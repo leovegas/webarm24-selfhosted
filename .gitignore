@@ -1,0 +1,14 @@
+# This directory is also your install directory. Everything below is local state and secrets: never commit it.
+.env
+.env.*
+!.env.example
+license/
+license.key
+*.key
+backups/
+.webarm-state
+webarm-support-*.tgz
+Caddyfile
+custom/*
+!custom/README.md
+docker-compose.override.yml

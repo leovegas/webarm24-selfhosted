@@ -1,0 +1,42 @@
+# WebArm24 Self-hosted reverse proxy. Configured from .env:
+#   PUBLIC_HOST  your domain (DNS A/AAAA record → this server); certificates are issued automatically
+#   ACME_EMAIL   optional contact for Let's Encrypt expiry notices
+#   TLS_MODE     empty = automatic Let's Encrypt; "internal" = Caddy's own CA (LAN / no public DNS)
+# webarmctl renders this into ./Caddyfile (the @@TLS@@ line becomes "tls internal" or is dropped).
+# Behind your own load balancer or TLS terminator? See docs/05-domain-tls.md.
+{
+	email {$ACME_EMAIL}
+}
+
+{$PUBLIC_HOST} {
+	@@TLS@@
+	encode zstd gzip
+
+	# Large uploads (stored files, imported bundles)
+	request_body {
+		max_size 250MB
+	}
+
+	reverse_proxy app:8000 {
+		health_uri /health
+		health_interval 5s
+		# WebSocket chat and long-running SSE responses
+		flush_interval -1
+		transport http {
+			read_timeout 15m
+			write_timeout 15m
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

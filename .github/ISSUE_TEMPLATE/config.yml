@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/leovegas/webarm24-selfhosted/blob/main/SECURITY.md
+    about: Please report privately to security@webarm24.online. Don't open a public issue.
+  - name: Buy a license / pricing
+    url: https://webarm24.online/self-hosted
+    about: Plans, seats, the Updates subscription and evaluation keys.
+  - name: Licensed customer support
+    url: mailto:support@webarm24.online
+    about: Private support. Include your license id (lic_…) and ./webarmctl support-bundle.

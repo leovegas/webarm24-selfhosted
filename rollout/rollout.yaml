@@ -1,0 +1,89 @@
+# Machine-readable twin of ROLLOUT.md. Each step: run `cmd` in `cwd`, then evaluate `expect` against the JSON
+# printed on stdout (JSONPath-ish: `.ok == true`). `human: true` = stop and get explicit approval / input first.
+version: 1
+cwd: /opt/webarm
+inputs:
+  - {name: PUBLIC_HOST, required: true, secret: false}
+  - {name: ADMIN_EMAILS, required: true, secret: false}
+  - {name: LICENSE_FILE, required: true, secret: true, note: "path to license.key"}
+  - {name: WEBARM_REGISTRY_USER, required: true, secret: false, note: "license id lic_..."}
+  - {name: WEBARM_REGISTRY_PASSWORD, required: true, secret: true}
+  - {name: AI_PROVIDER_KEY, required: true, secret: true, note: "ANTHROPIC_API_KEY or OPENAI_API_KEY"}
+  - {name: SMOKE_ADMIN_EMAIL, required: true, secret: false}
+  - {name: SMOKE_ADMIN_PASSWORD, required: true, secret: true}
+  - {name: TLS_MODE, required: false, secret: false, values: ["", internal]}
+forbidden_commands:
+  - "docker compose down -v"
+  - "./webarmctl uninstall --purge"
+  - "docker volume rm"
+  - "docker system prune --volumes"
+install:
+  - id: R01
+    title: Server prerequisites
+    cmd: "uname -m && docker version -f '{{.Server.Version}}' && docker compose version --short"
+    cwd: "."
+    expect_text: ["x86_64"]
+    on_failure: "Docker missing → ask human before installing (get.docker.com). Non-x86_64 → unsupported, stop."
+  - id: R02
+    title: Get the install kit (skip if ./webarmctl and VERSION already exist)
+    cmd: "git clone --branch stable https://github.com/leovegas/webarm24-selfhosted.git /opt/webarm && cat /opt/webarm/VERSION"
+    cmd_offline: "tar -xzf webarm-selfhost-bundle-*.tgz -C /opt/webarm --strip-components=1 && cat /opt/webarm/VERSION"
+    on_failure: "/opt/webarm not empty → ask human (may be an existing install). Offline → use cmd_offline."
+    cwd: "."
+    expect_regex: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+  - id: R03
+    title: Preflight
+    human: true
+    cmd: "PUBLIC_HOST=$PUBLIC_HOST ./webarmctl preflight --json"
+    expect: ".ok == true"
+    on_failure: "Show each failed check's .detail and .fix to the human; do not change sysctl/firewall/DNS without approval."
+  - id: R04
+    title: Registry login
+    cmd: "printf '%s' \"$WEBARM_REGISTRY_PASSWORD\" | docker login registry.webarm24.online -u \"$WEBARM_REGISTRY_USER\" --password-stdin"
+    expect_text: ["Login Succeeded"]
+    skip_if: "air-gapped (image loaded with docker load)"
+  - id: R05
+    title: Install
+    cmd: "PUBLIC_HOST=$PUBLIC_HOST ADMIN_EMAILS=$ADMIN_EMAILS LICENSE_FILE=$LICENSE_FILE ./webarmctl install --json"
+    expect: ".ok == true && .checks[?(@.check=='app healthy')].ok == true"
+    rollback: "./webarmctl uninstall --yes"
+  - id: R06
+    title: AI provider / SMTP
+    cmd: "./webarmctl restart --json"
+    pre: "write provider key (and SMTP_*) into .env without echoing values"
+    expect: ".ok == true"
+    verify: "./webarmctl doctor --json → check 'AI provider key' ok without warning"
+  - id: R07
+    title: Admin account + license
+    human: true
+    cmd: "./webarmctl license status --json"
+    pre: "human creates the admin account at https://$PUBLIC_HOST/setup"
+    expect: ".license == 'valid'"
+    on_failure: "look up .code in docs/04-license.md#error-codes; WA-LIC-002 → human decides renew vs older tag"
+  - id: R08
+    title: Smoke test
+    cmd: "./webarmctl smoke --json"
+    expect: ".ok == true"
+    on_failure: "python sandbox → docs/12-troubleshooting.md#sandbox"
+  - id: R09
+    title: Backup + schedule
+    cmd: "./webarmctl backup --json"
+    expect: ".ok == true"
+    post: "( crontab -l 2>/dev/null | grep -v 'webarmctl backup'; echo '17 3 * * * cd /opt/webarm && ./webarmctl backup --json >> backups/backup.log 2>&1' ) | crontab -"
+    remind_human: "backups contain secrets; copy them off-server encrypted"
+  - id: R10
+    title: Final health + handover
+    cmd: "./webarmctl doctor --json"
+    expect: ".ok == true"
+    report: [url, version, license_state, seats, updates_until, env_location, backup_location, cron, warnings]
+upgrade:
+  - {id: U01, title: Release notes, cmd: "cat docs/CHANGELOG.md", human: true}
+  - {id: U02, title: Health before, cmd: "./webarmctl doctor --json", expect: ".ok == true"}
+  - {id: U03, title: Upgrade, cmd: "./webarmctl upgrade $TAG --json", expect: ".ok == true",
+     on_failure: "rolled_back_to present → report logs; WA-LIC-002 → human"}
+  - {id: U04, title: Smoke, cmd: "./webarmctl smoke --json", expect: ".ok == true", rollback: "./webarmctl rollback --yes", human_for_rollback: true}
+  - {id: U05, title: Report, cmd: "./webarmctl version --json"}
+restore:
+  - {id: D01, title: Pick backup, cmd: "ls -1t backups/webarm-*.tgz | head", human: true}
+  - {id: D02, title: Restore, cmd: "./webarmctl restore $BACKUP --yes --json", expect: ".ok == true", human: true}
+  - {id: D03, title: Verify, cmd: "./webarmctl doctor --json && ./webarmctl smoke --json", expect: ".ok == true"}

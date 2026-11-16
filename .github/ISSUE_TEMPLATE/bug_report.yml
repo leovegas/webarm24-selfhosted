@@ -1,0 +1,43 @@
+name: Bug or install problem
+description: Something in the install, upgrade, webarmctl or the app doesn't work.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Don't paste secrets.** No license key (`WA1.…`), `.env`, registry password or unredacted logs: this issue is public.
+        `./webarmctl support-bundle` makes a redacted bundle. E-mail it to support@webarm24.online if it's needed.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. ./webarmctl upgrade 1.2.0\n2. …"
+  - type: textarea
+    id: version
+    attributes:
+      label: "`./webarmctl version` output"
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`./webarmctl doctor --json` output"
+      description: Contains no secrets, but check it before posting.
+      render: json
+  - type: input
+    id: host
+    attributes:
+      label: Host
+      placeholder: Ubuntu 24.04, Docker 27.3, Compose 2.29, Hetzner CX42
+  - type: dropdown
+    id: agent
+    attributes:
+      label: Did an AI agent run the install or upgrade?
+      options: ["No", "Yes: Claude Code", "Yes: another agent"]

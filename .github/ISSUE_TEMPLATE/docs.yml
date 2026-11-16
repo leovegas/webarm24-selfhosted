@@ -1,0 +1,17 @@
+name: Documentation or runbook problem
+description: A doc, rollout step or skill is wrong, unclear or missing something.
+labels: [docs]
+body:
+  - type: input
+    id: where
+    attributes:
+      label: Which file and section?
+      placeholder: docs/05-domain-tls.md "Your own reverse proxy", or rollout step R07
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What's wrong, and what should it say?
+    validations:
+      required: true
