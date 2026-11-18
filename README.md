@@ -4,6 +4,8 @@ Run the complete [WebArm24](https://webarm24.online) automation platform on your
 
 This repository is the **install kit**. It holds the Docker Compose stack, the `webarmctl` operations tool, the full documentation, an agent-ready rollout runbook and Claude Code skills. It contains **no application code**. The application ships as a licensed Docker image from `registry.webarm24.online`.
 
+![WebArm24 UI: pipeline editor with agent, Python, AI agent and if/else steps, then the workflow canvas with a router, approval wait and AI assistant](assets/webarm24-ui-tour.gif)
+
 **[Pricing and purchase →](https://webarm24.online/self-hosted)** · **[Documentation →](docs/README.md)** · **[Changelog →](docs/CHANGELOG.md)**
 
 ---
